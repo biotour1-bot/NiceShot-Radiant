@@ -301,7 +301,7 @@ const MemberFormView = ({ editingMember, members, setMembers, setSubView }) => {
   );
 };
 
-const EventSetupView = ({ eventData, setEventData, setSubView }) => {
+const EventSetupView = ({ eventData, setEventData, setTeams, setSubView }) => {
   const [localEvent, setLocalEvent] = useState(eventData || { name: '', location: '', date: '', teamCount: 4, teeTimes: [] });
   const handleCount = (n) => {
     const times = localEvent?.teeTimes || [];
@@ -372,6 +372,10 @@ const EventSetupView = ({ eventData, setEventData, setSubView }) => {
               teamCount: data[0].team_count,
               teeTimes: data[0].tee_times
             });
+            // 신규 대회 생성 시 teams 초기화 (기존 조편성 잔류 방지)
+            if (!localEvent.id) {
+              setTeams([]);
+            }
             setSubView('MAIN');
           } else {
              console.error('Error saving event:', error?.message);
@@ -384,7 +388,10 @@ const EventSetupView = ({ eventData, setEventData, setSubView }) => {
 };
 
 const TeamAssignmentView = ({ eventData, members, teams, setTeams, setSubView, setActiveTab }) => {
-  const [isConfirmed, setIsConfirmed] = useState(false);
+  const [selectedTeamId, setSelectedTeamId] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [hasSaved, setHasSaved] = useState(false);
+  const [showDispatch, setShowDispatch] = useState(false);
 
   useEffect(() => {
     const targetCount = eventData?.teamCount || 4;
@@ -406,30 +413,51 @@ const TeamAssignmentView = ({ eventData, members, teams, setTeams, setSubView, s
     }
   }, [eventData?.teamCount, setTeams, teams.length]);
 
-  const unassignedMembers = (members || []).filter(m => !teams?.some(t => t?.memberIds?.includes(m?.id)) && m?.status === '활동');
+  const unassignedMembers = (members || []).filter(
+    m => !teams?.some(t => t?.memberIds?.includes(m?.id)) && m?.status === '활동'
+  );
 
-  const toggleMemberInTeam = (teamId, memberId) => {
-    if (isConfirmed) return;
-    const newTeams = teams.map(t => {
-      if (t.id === teamId) {
-        if (t.memberIds.includes(memberId)) {
-          return { ...t, memberIds: t.memberIds.filter(id => id !== memberId) };
-        } else {
+  // 조에서 이름 클릭 → 미편성으로 반환
+  const removeMemberFromTeam = (teamId, memberId) => {
+    setSelectedTeamId(null);
+    setTeams(prev => prev.map(t =>
+      t.id === teamId ? { ...t, memberIds: t.memberIds.filter(id => id !== memberId) } : t
+    ));
+  };
+
+  // 빈 슬롯 클릭 → 해당 팀을 선택 상태로
+  const selectTeamSlot = (teamId) => {
+    setSelectedTeamId(prev => prev === teamId ? null : teamId);
+  };
+
+  // 사이드바에서 이름 클릭 → selectedTeamId 팀에 배정 or 빈 자리 첫 팀에 배정
+  const assignMember = (memberId) => {
+    if (selectedTeamId) {
+      setTeams(prev => prev.map(t => {
+        if (t.id === selectedTeamId) {
           if (t.memberIds.length >= 4) return t;
           return { ...t, memberIds: [...t.memberIds, memberId] };
         }
-      }
-      return { ...t, memberIds: t.memberIds.filter(id => id !== memberId) };
-    });
-    setTeams(newTeams);
+        return { ...t, memberIds: t.memberIds.filter(id => id !== memberId) };
+      }));
+      setSelectedTeamId(null);
+    } else {
+      // 선택된 슬롯 없으면 빈 자리 있는 첫 팀에 자동 배정
+      setTeams(prev => {
+        const next = [...prev];
+        const idx = next.findIndex(t => t.memberIds.length < 4);
+        if (idx !== -1) {
+          next[idx] = { ...next[idx], memberIds: [...next[idx].memberIds, memberId] };
+        }
+        return next;
+      });
+    }
   };
 
   const handleAutoAssign = () => {
-    if (isConfirmed) return;
+    setSelectedTeamId(null);
     const activeMembers = members.filter(m => m.status === '활동');
     const newTeams = teams.map(t => ({ ...t, memberIds: [] }));
-    
-    // Distribute members across teams
     activeMembers.forEach((member, index) => {
       const teamIdx = index % (eventData?.teamCount || 4);
       if (newTeams[teamIdx] && newTeams[teamIdx].memberIds.length < 4) {
@@ -439,76 +467,227 @@ const TeamAssignmentView = ({ eventData, members, teams, setTeams, setSubView, s
     setTeams(newTeams);
   };
 
+  const handleSave = async () => {
+    setSelectedTeamId(null);
+    // Supabase의 events 테이블에 조편성 저장
+    if (eventData?.id) {
+      const { error } = await supabase
+        .from('events')
+        .update({ teams })
+        .eq('id', eventData.id);
+      if (error) {
+        console.error('조편성 저장 실패:', error.message);
+        alert('조편성 저장 중 오류가 발생했습니다:\n' + error.message);
+        return;
+      }
+    }
+    setHasSaved(true);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  // 송부용 텍스트 생성
+  const buildDispatchText = () => {
+    const lines = [];
+    const eventName = eventData?.name || '월례회';
+    const eventDate = eventData?.date ? eventData.date.replace(/-/g, '.') : '';
+    const eventLoc = eventData?.location || '';
+    lines.push(`📋 ${eventName} 조편성 안내`);
+    if (eventDate || eventLoc) lines.push(`📅 ${eventDate}${eventLoc ? '  📍 ' + eventLoc : ''}`);
+    lines.push('');
+    teams.forEach((t, idx) => {
+      const teeTime = eventData?.teeTimes?.[idx] || '08:00';
+      lines.push(`🏌️ ${t.name}  (티업: ${teeTime})`);
+      t.memberIds.forEach((mId, i) => {
+        const m = members.find(x => x.id === mId);
+        if (m) lines.push(`  ${i + 1}. ${m.name}  ${m.contact || '-'}`);
+      });
+      lines.push('');
+    });
+    return lines.join('\n');
+  };
+
   return (
-    <div className="animate-fade-in section-spacing">
+    <div className="animate-fade-in section-spacing" onClick={() => setSelectedTeamId(null)}>
       <div className="flex justify-between items-center mb-6">
         <h2 className="heading text-xl">조편성 및 티오프</h2>
         <div className="flex gap-2">
-          {!isConfirmed && <button className="btn-outline px-4 py-2 text-[11px] border-primary/40 bg-primary/10" onClick={handleAutoAssign}>자동 조편성</button>}
+          <button className="btn-outline px-4 py-2 text-[11px] border-primary/40 bg-primary/10" onClick={handleAutoAssign}>자동 조편성</button>
           <button className="btn-outline px-4 py-2 text-[11px]" onClick={() => { setActiveTab('HOME'); setSubView('MAIN'); }}>← 대시보드</button>
         </div>
       </div>
 
-      <div className="flex gap-6 items-start">
-        {/* Left Sidebar: Unassigned Pool */}
-        <div className="w-32 glass-panel p-4 flex flex-col gap-3 sticky top-24 max-h-70vh overflow-y-auto">
+      <div className="flex gap-4 items-start">
+        {/* 좌측 사이드바: 항상 표시 */}
+        <div className="w-28 flex-shrink-0 glass-panel p-3 flex flex-col gap-2 sticky top-24 overflow-y-auto" style={{ maxHeight: '70vh' }}>
           <h3 className="text-[9px] font-black text-dim uppercase tracking-widest text-center border-b border-white/5 pb-2">참가자 명단</h3>
-          <div className="flex flex-col gap-2">
+          {selectedTeamId && (
+            <div className="text-[9px] text-primary font-black text-center bg-primary/15 rounded-lg px-1 py-1.5 border border-primary/40">
+              ↓ 선택하세요
+            </div>
+          )}
+          <div className="flex flex-col gap-1.5">
             {unassignedMembers.map(m => (
-              <button key={m.id} className="w-full bg-white/5 border border-white/10 p-2 rounded-xl text-[11px] font-bold text-white hover:border-primary transition-all text-center" onClick={() => {
-                if (isConfirmed) return;
-                const team = teams.find(t => t.memberIds.length < 4);
-                if (team) toggleMemberInTeam(team.id, m.id);
-              }}>
+              <button
+                key={m.id}
+                className={`w-full p-2 rounded-xl text-[11px] transition-all text-center border ${
+                  selectedTeamId
+                    ? 'bg-primary border-primary font-black text-white shadow-lg shadow-primary/30 hover:bg-primary/80'
+                    : 'bg-white/5 border-white/10 font-bold text-white hover:border-primary/60'
+                }`}
+                onClick={(e) => { e.stopPropagation(); assignMember(m.id); }}
+              >
                 {m.name}
               </button>
             ))}
-            {unassignedMembers.length === 0 && <div className="text-[10px] text-dim text-center py-4">모두 편성됨</div>}
+            {unassignedMembers.length === 0 && (
+              <div className="text-[10px] text-dim text-center py-4 opacity-60">모두 편성됨</div>
+            )}
           </div>
         </div>
 
-        {/* Right Content: Teams List */}
+        {/* 우측: 조 목록 */}
         <div className="flex-1 flex flex-col relative pb-32">
-          <div className="space-y-4">
-          {teams.map((t, idx) => (
-            <div key={t.id} className="glass-panel p-4 border-l-4 border-primary/40">
-              <div className="flex justify-between items-center mb-3">
-                <div className="flex items-center gap-2">
-                  <span className="bg-primary text-white text-[10px] px-2 py-0.5 rounded font-black">{t?.name || 'Team'}</span>
-                  <span className="text-xs font-bold text-white">{eventData?.teeTimes?.[idx] || '08:00'}</span>
-                </div>
-                <span className="text-[10px] text-dim">{(t?.memberIds || []).length}/4 명</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                {[0, 1, 2, 3].map(slot => {
-                  const mId = t.memberIds[slot];
-                  const member = members.find(m => m.id === mId);
-                  return (
-                    <div key={slot} className={`h-10 rounded-lg border flex items-center px-3 justify-between ${member ? 'bg-black/30 border-white/10' : 'bg-transparent border-dashed border-white/5'}`} onClick={() => member && toggleMemberInTeam(t.id, member.id)}>
-                      {member ? (
-                        <>
-                          <span className="text-xs font-bold text-white">{member.name}</span>
-                          <span className="text-[10px] text-accent italic">{calculateAvg(member.history)}</span>
-                        </>
-                      ) : <span className="text-[9px] text-dim opacity-30">비어있음</span>}
+          <div className="space-y-3">
+            {teams.map((t, idx) => {
+              const isTeamSelected = selectedTeamId === t.id;
+              return (
+                <div
+                  key={t.id}
+                  className={`glass-panel p-4 border-l-4 transition-all ${
+                    isTeamSelected ? 'border-primary shadow-lg shadow-primary/20' : 'border-primary/40'
+                  }`}
+                >
+                  <div className="flex justify-between items-center mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="bg-primary text-white text-[10px] px-2 py-0.5 rounded font-black">{t?.name || 'Team'}</span>
+                      <span className="text-xs font-bold text-white">{eventData?.teeTimes?.[idx] || '08:00'}</span>
                     </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
+                    <span className="text-[10px] text-dim">{(t?.memberIds || []).length}/4 명</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[0, 1, 2, 3].map(slot => {
+                      const mId = t.memberIds[slot];
+                      const member = members.find(m => m.id === mId);
+                      return (
+                        <div
+                          key={slot}
+                          className={`h-10 rounded-lg border flex items-center px-3 justify-between cursor-pointer transition-all select-none ${
+                            member
+                              ? 'bg-black/30 border-white/10 hover:border-error/60 hover:bg-error/10'
+                              : isTeamSelected
+                                ? 'bg-primary/15 border-primary/60 border-solid'
+                                : 'bg-transparent border-dashed border-white/10 hover:border-primary/40'
+                          }`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (member) {
+                              // 이름 클릭 → 미편성으로 반환
+                              removeMemberFromTeam(t.id, member.id);
+                            } else {
+                              // 빈 슬롯 클릭 → 이 팀을 선택 상태로
+                              selectTeamSlot(t.id);
+                            }
+                          }}
+                        >
+                          {member ? (
+                            <>
+                              <span className="text-xs font-bold text-white">{member.name}</span>
+                              <span className="text-[9px] text-error/50 font-bold">✕</span>
+                            </>
+                          ) : (
+                            <span className={`text-[9px] font-bold ${isTeamSelected ? 'text-primary/80' : 'text-dim opacity-30'}`}>
+                              {isTeamSelected ? '← 선택' : '비어있음'}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-          
-          <div className="sticky bottom-24 mt-6 z-50 flex gap-4">
-            {!isConfirmed ? (
-               <button className="btn-primary w-full py-4 shadow-2xl font-black italic tracking-widest text-[1.35rem]" onClick={() => setIsConfirmed(true)}>조편성 저장</button>
-            ) : (
-               <>
-                 <button className="btn-primary flex-1 py-4 shadow-2xl font-black italic tracking-widest" onClick={() => { setIsConfirmed(false); setActiveTab('ACTION'); setSubView('MAIN'); }}>조편성 수정</button>
-                 <button className="btn-primary flex-1 py-4 shadow-2xl font-black italic tracking-widest" onClick={() => { setActiveTab('HOME'); setSubView('MAIN'); }}>대시보드로 이동</button>
-               </>
+
+          <div className="sticky bottom-24 mt-6 z-50 flex gap-3">
+            <button
+              className={`btn-primary flex-1 py-4 shadow-2xl font-black italic tracking-widest text-lg transition-all ${saved ? 'opacity-70' : ''}`}
+              onClick={handleSave}
+            >
+              {saved ? '✓ 저장 완료!' : '조편성 저장'}
+            </button>
+            {(hasSaved || teams.some(t => t.memberIds && t.memberIds.length > 0)) && (
+              <button
+                className="btn-outline flex-shrink-0 px-5 py-4 font-black text-sm border-accent/60 text-accent hover:bg-accent/10 transition-all"
+                onClick={(e) => { e.stopPropagation(); setShowDispatch(true); }}
+              >
+                📨 송부
+              </button>
             )}
           </div>
+
+          {/* 조편성 송부 모달 */}
+          {showDispatch && (
+            <div
+              className="fixed inset-0 z-[300] flex items-end justify-center"
+              style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(6px)' }}
+              onClick={() => setShowDispatch(false)}
+            >
+              <div
+                className="w-full max-w-lg glass-panel rounded-t-3xl p-6 pb-10 animate-fade-in"
+                style={{ maxHeight: '85vh', overflowY: 'auto' }}
+                onClick={e => e.stopPropagation()}
+              >
+                <div className="flex justify-between items-center mb-5">
+                  <span className="text-sm font-black text-white tracking-widest">📨 조편성 송부</span>
+                  <button className="text-dim text-xs font-bold hover:text-white" onClick={() => setShowDispatch(false)}>✕ 닫기</button>
+                </div>
+
+                {/* 조별 카드 */}
+                <div className="space-y-4 mb-6">
+                  {teams.map((t, idx) => {
+                    const teeTime = eventData?.teeTimes?.[idx] || '08:00';
+                    const teamMembers = t.memberIds.map(mId => members.find(m => m.id === mId)).filter(Boolean);
+                    return (
+                      <div key={t.id} className="bg-black/40 border border-white/10 rounded-2xl p-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <span className="bg-primary text-white text-[10px] px-2 py-0.5 rounded font-black">{t.name}</span>
+                          <span className="text-accent font-black text-sm">티업 {teeTime}</span>
+                        </div>
+                        <div className="space-y-2">
+                          {teamMembers.map((m, i) => (
+                            <div key={m.id} className="flex justify-between items-center">
+                              <span className="text-white font-bold text-sm">{i + 1}. {m.name}</span>
+                              <span className="text-dim text-xs font-bold tracking-wider">{m.contact || '-'}</span>
+                            </div>
+                          ))}
+                          {teamMembers.length === 0 && <div className="text-dim text-xs italic">편성된 참가자 없음</div>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* 복사 버튼 */}
+                <button
+                  className="btn-primary w-full py-4 font-black text-base"
+                  onClick={() => {
+                    navigator.clipboard.writeText(buildDispatchText())
+                      .then(() => alert('클립보드에 복사되었습니다!\n메시지 앱에 붙여넣기 하세요.'))
+                      .catch(() => alert('복사 실패. 아래 내용을 직접 복사해 주세요.'));
+                  }}
+                >
+                  📋 텍스트 복사
+                </button>
+
+                {/* 미리보기 텍스트 */}
+                <div className="mt-4 bg-black/60 border border-white/5 rounded-xl p-4">
+                  <div className="text-[9px] text-dim uppercase tracking-widest mb-2 font-black">메시지 미리보기</div>
+                  <pre className="text-[11px] text-white/80 whitespace-pre-wrap font-sans leading-relaxed">{buildDispatchText()}</pre>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -684,7 +863,7 @@ const RankingView = ({ members, setMembers, viewMode, teams }) => {
                       </div>
                     </td>
                     <td className="p-2 text-center align-top font-black text-sm text-white pt-3">{item.name}</td>
-                    <td className="p-2 px-3 align-top py-3 text-[11px] font-bold text-white/90 leading-relaxed break-words whitespace-pre-wrap">{item.content}</td>
+                    <td className="p-2 px-3 align-top py-3 text-[11px] font-bold text-white/90 leading-relaxed break-words whitespace-pre-wrap">{viewMode === 'LIVE' ? item.content.replace(/^\d{4}-\d{2}(-\d{2})?\s/, '') : item.content}</td>
                     {viewMode === 'ADMIN' && (
                       <td className="p-2 text-center align-top pt-2">
                         <button className="text-[10px] text-error font-black px-1 py-1 opacity-50 hover:opacity-100" onClick={() => handleDeleteRecord(item.memberId, item.type, item.index)}>삭제</button>
@@ -1045,11 +1224,16 @@ function App() {
       const { data: eventsData, error: eventsError } = await supabase.from('events').select('*').order('created_at', { ascending: false }).limit(1);
       if (eventsError) throw eventsError;
       if (eventsData && eventsData.length > 0) {
+        const ev = eventsData[0];
         setEventData({
-          ...eventsData[0],
-          teamCount: eventsData[0].team_count || 4,
-          teeTimes: eventsData[0].tee_times || []
+          ...ev,
+          teamCount: ev.team_count || 4,
+          teeTimes: ev.tee_times || []
         });
+        // 저장된 조편성 불러오기
+        if (ev.teams && Array.isArray(ev.teams) && ev.teams.length > 0) {
+          setTeams(ev.teams);
+        }
       }
     } catch (err) {
       console.error('Database fetch error:', err.message);
@@ -1140,7 +1324,7 @@ function App() {
                     {subView === 'MAIN' && <AdminDashboard eventData={eventData} viewMode={viewMode} notices={notices} setSubView={setSubView} />}
                     {subView === 'MEMBER_MGMT' && <MemberMgmtView members={members} setSubView={setSubView} setEditingMember={setEditingMember} />}
                     {subView === 'MEMBER_LIST' && <MemberListView members={members} setSubView={setSubView} />}
-                    {subView === 'EVENT_SETUP' && <EventSetupView eventData={eventData} setEventData={setEventData} setSubView={setSubView} />}
+                    {subView === 'EVENT_SETUP' && <EventSetupView eventData={eventData} setEventData={setEventData} setTeams={setTeams} setSubView={setSubView} />}
                     {subView === 'MEMBER_FORM' && <MemberFormView editingMember={editingMember} members={members} setMembers={setMembers} setSubView={setSubView} />}
                     {subView === 'NOTICES' && <NoticeView viewMode={viewMode} notices={notices} setNotices={setNotices} setSubView={setSubView} />}
                     {subView === 'ADMIN_BOARD' && <AdminBoardView adminNotes={adminNotes} setAdminNotes={setAdminNotes} setSubView={setSubView} />}
@@ -1157,7 +1341,56 @@ function App() {
           {viewMode === 'LIVE' && (
             <div className="space-y-6">
               {activeTab === 'HOME' && <AdminDashboard eventData={eventData} viewMode={viewMode} notices={notices} setSubView={setSubView} />}
-              {activeTab === 'ACTION' && <LiveScoreInputView eventData={eventData} teams={teams} members={members} setMembers={setMembers} setActiveTab={setActiveTab} viewMode={viewMode} />}
+              {activeTab === 'ACTION' && (
+                <div className="animate-fade-in section-spacing">
+                  <div className="flex justify-between items-center mb-6">
+                    <h2 className="heading text-xl">조편성 현황</h2>
+                    <div className="flex items-center gap-2">
+                      {eventData?.name && <span className="text-[10px] text-dim font-bold">{eventData.name}</span>}
+                    </div>
+                  </div>
+                  {(!teams || teams.length === 0 || !teams.some(t => t.memberIds && t.memberIds.length > 0)) ? (
+                    <div className="glass-panel p-10 text-center text-dim italic text-sm">
+                      <div className="text-3xl mb-3 opacity-30">🏌️</div>
+                      아직 조편성이 완료되지 않았습니다.
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {teams.map((t, idx) => (
+                        <div key={t.id} className="glass-panel p-4 border-l-4 border-primary/40">
+                          <div className="flex justify-between items-center mb-3">
+                            <div className="flex items-center gap-2">
+                              <span className="bg-primary text-white text-[10px] px-2 py-0.5 rounded font-black">{t?.name || 'Team'}</span>
+                              <span className="text-xs font-bold text-white">{eventData?.teeTimes?.[idx] || '08:00'}</span>
+                            </div>
+                            <span className="text-[10px] text-dim">{(t?.memberIds || []).length}명</span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            {[0, 1, 2, 3].map(slot => {
+                              const mId = t.memberIds[slot];
+                              const member = members.find(m => m.id === mId);
+                              return (
+                                <div key={slot} className={`h-10 rounded-lg border flex items-center px-3 justify-between ${
+                                  member ? 'bg-black/30 border-white/10' : 'bg-transparent border-dashed border-white/5'
+                                }`}>
+                                  {member ? (
+                                    <>
+                                      <span className="text-xs font-bold text-white">{member.name}</span>
+                                      <span className="text-[10px] text-accent italic">{calculateAvg(member.history)}</span>
+                                    </>
+                                  ) : (
+                                    <span className="text-[9px] text-dim opacity-30">비어있음</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               {activeTab === 'RANK' && <RankingView members={members} setMembers={setMembers} viewMode={viewMode} teams={teams} />}
             </div>
           )}
@@ -1171,7 +1404,7 @@ function App() {
 
        <div className="nav-container">
          <nav className="glass-panel flex justify-around p-2 rounded-full shadow-2xl border border-white/10">
-            {[{id:'HOME', i:Icons.Home, l:'홈'}, {id:'ACTION', i:Icons.Action, l:viewMode==='ADMIN'?'조편성':'입력'}, {id:'RANK', i:Icons.Rank, l:'순위'}]
+            {[{id:'HOME', i:Icons.Home, l:'홈'}, {id:'ACTION', i:Icons.Action, l:'조편성'}, {id:'RANK', i:Icons.Rank, l:'순위'}]
               .map(t => (
                 <button key={t.id} onClick={() => { setActiveTab(t.id); setSubView('MAIN'); }} className="flex flex-col items-center gap-1 transition-all py-2 flex-1 outline-none" style={{ opacity: activeTab === t.id ? 1 : 0.4 }}>
                   <t.i active={activeTab === t.id} />
